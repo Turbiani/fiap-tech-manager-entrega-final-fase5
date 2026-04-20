@@ -1,0 +1,90 @@
+# ========================
+# Sistema Operacional
+# ========================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ========================
+# IDEs e Editores
+# ========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.editorconfig
+
+# ========================
+# Node.js (se scripts de geração)
+# ========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ========================
+# Python (se scripts de processamento)
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.env
+venv/
+.venv/
+
+# ========================
+# Arquivos temporários e de build
+# ========================
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+dist/
+build/
+.cache/
+
+# ========================
+# Arquivos sensíveis (NUNCA commitar)
+# ========================
+.env
+.env.local
+.env.*.local
+secrets.json
+credentials.json
+*.key
+*.pem
+*.p12
+config/local.json
+
+# ========================
+# Documentos grandes / binários
+# ========================
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# ========================
+# PDFs de aulas (material proprietário FIAP)
+# ========================
+/aulas/**/*.pdf
+/material-curso/**/*.pdf
+
+# ========================
+# Outputs gerados automaticamente
+# ========================
+/outputs/
+/generated/
+
+# ========================
+# Arquivos do sistema de colaboração
+# ========================
+.claude/
