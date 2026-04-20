@@ -182,11 +182,19 @@ sequenceDiagram
     SQS->>AS: ✅ Evidência de controle visual (Risco 3)
     Note right of EA: Se FAILED → bloqueia fluxo automaticamente (Risco 3)
 
-    Note over V,CE: ETAPA 3 — Consulta de Cadastro (evento: VISITOR_LOOKUP)
+    Note over V,CE: ETAPA 3 — Consulta de Cadastro (evento: VISITOR_LOOKUP_COMPLETED)
     EA->>DE: Solicita lookup do visitante
     DE->>SQS: Publica VISITOR_LOOKUP_STARTED
     SQS->>AS: ✅ Evidência que lookup foi iniciado (Risco 1)
     DE-->>EA: Visitante encontrado / não encontrado
+
+    Note over V,CE: ETAPA 3b — Cadastro de novo visitante [Branch B apenas]
+    alt Visitante NOVO
+        DE->>SQS: Publica VISITOR_REGISTERED {visitor_id, cpf_validated, face_embedding_id}
+        SQS->>AS: ✅ Prova que cadastro foi CRIADO — Risco 1 + Risco 2 (gap corrigido)
+    else Visitante EXISTENTE
+        Note right of DE: Pula para Etapa 4 diretamente
+    end
 
     Note over V,CE: ETAPA 4 — Autorização do Morador (evento: AUTHORIZATION_REQUESTED)
     DE->>NS: Solicita push para morador
@@ -195,13 +203,23 @@ sequenceDiagram
     DE->>SQS: Publica AUTHORIZATION_GRANTED {morador_id, timestamp, biometric_hash}
     SQS->>AS: ✅ Evidência de autorização explícita e rastreável (Risco 2)
 
-    Note over V,CE: ETAPA 5 — Detecção de Coação (paralela, contínua)
+    Note over V,CE: ETAPA 5a — Coação no Totem / Vetor A (paralela, contínua)
     EA->>CAI: Análise vocal contínua durante interação
     CAI-->>CE: Padrão vocal + palavras-chave
     CE->>CE: Analisa: hesitação + horário + histórico
     CE->>SQS: Publica COERCION_RISK_DETECTED (se score alto)
-    SQS->>AS: ✅ Alerta silencioso registrado (Risco 4)
-    Note right of CE: Operador notificado silenciosamente
+    SQS->>AS: ✅ Alerta silencioso — Vetor A (visitante coagindo)
+
+    Note over V,CE: ETAPA 5b — Coação do Morador / Vetor B (gap corrigido)
+    alt Morador aciona Panic Code (hold 3s ou PIN alternativo)
+        MA->>DE: Autorização com flag distress=true
+        DE->>SQS: Publica COERCION_SILENT_ALARM {trigger, morador_id, response_time_ms}
+        SQS->>AS: ✅ Alerta silencioso — Vetor B (morador sob ameaça interna)
+        Note right of MA: Acesso liberado normalmente para não escalar ameaça
+    else Anomalia comportamental detectada
+        DE->>SQS: Publica COERCION_SILENT_ALARM {trigger: behavioral_anomaly}
+        SQS->>AS: ✅ Alerta por padrão atípico de autorização
+    end
 
     Note over V,CE: ETAPA 6 — Liberação (evento: ACCESS_GRANTED)
     DE->>SQS: Publica ACCESS_GRANTED {cadeia de eventos rastreados}
@@ -421,10 +439,61 @@ Adotamos **Event-Driven Architecture com padrão Saga** para o fluxo de acesso:
 - **Nenhuma etapa pode ser pulada**: o Decision Engine valida a sequência de eventos antes de autorizar o próximo passo
 - Eventos são **append-only** com hash encadeado — qualquer adulteração é detectável
 
-Fluxo de eventos obrigatórios para um acesso:
+### Detecção de Coação — Dois Vetores (fix do Gap Risco 4)
+
+O TC descreve dois cenários de pressão distintos que exigem mecanismos diferentes:
+
+**Vetor A — Pressão no Totem (lado do visitante):**
+Coercion Engine no Edge analisa o áudio do totem: palavras-chave suspeitas, hesitação vocal, score composto com horário e histórico. Emite `COERCION_RISK_DETECTED` silenciosamente para operador e SIEM.
+
+**Vetor B — Coação do Morador internamente (lado do app):**
+O TC diz: *"morador legítimo possa estar sob ameaça — a simples confirmação de identidade deixa de ser indicador confiável."* Este cenário exige mecanismo **no app do morador**, não no totem:
+
+- **Panic Code Silencioso:** o morador tem dois fluxos de autorização. O fluxo de distress (segurar o botão 3+ segundos, ou PIN alternativo pré-configurado) autoriza o acesso *aparentemente*, mas emite `COERCION_SILENT_ALARM` para o operador e SIEM sem bloquear — para não escalar a ameaça.
+- **Anomalia Comportamental:** o Anomaly Detector monitora padrões de autorização do morador — velocidade atípica, geolocalização incomum, sequência de toques diferente do baseline histórico.
+
+```json
+{
+  "event_type": "COERCION_SILENT_ALARM",
+  "trigger": "panic_hold | panic_pin | behavioral_anomaly",
+  "access_request_id": "uuid",
+  "morador_id": "uuid",
+  "response_time_ms": 450,
+  "dispatched_to": ["operator", "siem"]
+}
 ```
-VISITOR_PRESENTED → VISUAL_CHECK_PASSED → VISITOR_LOOKUP_COMPLETED → 
+
+O acesso é liberado normalmente (para não escalar a ameaça), mas operador e SOC recebem contexto completo para resposta imediata.
+
+Fluxo de eventos obrigatórios para um acesso:
+
+**Branch A — Visitante existente:**
+```
+VISITOR_PRESENTED → VISUAL_CHECK_PASSED → VISITOR_LOOKUP_COMPLETED →
 AUTHORIZATION_REQUESTED → AUTHORIZATION_GRANTED → ACCESS_GRANTED
+```
+
+**Branch B — Visitante novo (corrige Gap Risco 1 + Risco 2):**
+```
+VISITOR_PRESENTED → VISUAL_CHECK_PASSED → VISITOR_LOOKUP_COMPLETED →
+VISITOR_REGISTERED → AUTHORIZATION_REQUESTED → AUTHORIZATION_GRANTED → ACCESS_GRANTED
+```
+
+O evento `VISITOR_REGISTERED` é emitido exclusivamente no branch de novo visitante, **antes** da solicitação de autorização. Comprova que o cadastro foi **criado**, não apenas consultado — endereçando o requisito literal do TC: *"Que o cadastro foi efetivamente criado ou validado."*
+
+```json
+{
+  "event_type": "VISITOR_REGISTERED",
+  "payload": {
+    "visitor_id": "uuid",
+    "cpf_validated": true,
+    "face_embedding_id": "uuid",
+    "registration_source": "edge_ocr | voice_input | operator",
+    "receita_federal_check": "approved | skipped"
+  },
+  "previous_hash": "sha256(VISITOR_LOOKUP_COMPLETED)",
+  "current_hash": "sha256(conteúdo + previous_hash)"
+}
 ```
 
 Se qualquer evento não for recebido dentro do timeout definido, o Saga emite `ACCESS_TIMEOUT` e o fluxo é encerrado — nunca avança sem confirmação.
@@ -488,6 +557,7 @@ Adotamos **CQRS (Command Query Responsibility Segregation)** para a camada de au
 - PostgreSQL Read Replica (AWS RDS Multi-AZ) com replicação streaming do write side
 - Event Processor processa e projeta views otimizadas para cada caso de uso:
   - `compliance_view`: por condomínio, por período, por morador
+  - `compliance_rate_view`: **taxa de completude do fluxo por período** — mostra % de acessos que completaram todas as etapas obrigatórias, endereçando o requisito do TC de *"sustentar a execução rigorosa ao longo do tempo"*
   - `risk_view`: eventos de anomalia, alertas de coação, acessos negados
   - `dashboard_view`: projeção em Redis para latência < 50ms no painel do operador
 - Índices ricos nas views, sem impacto na escrita
@@ -525,12 +595,12 @@ Reavaliar se o volume de dados do write side superar 10TB — nesse ponto, avali
 
 | Risco do TC | Componente Arquitetural | Mecanismo Técnico | Evidência |
 |---|---|---|---|
-| **Risco 1** — Falta de Garantia de Processo | Decision Engine (Saga) | Fluxo de eventos obrigatório; próxima etapa só avança com evento anterior confirmado | Log de eventos com sequência obrigatória |
-| **Risco 2** — Ausência de Evidências Auditáveis | Audit Service (CQRS Write) | Hash encadeado SHA-256; append-only; timestamp imutável por evento | Cadeia de eventos inviolável + relatórios de compliance |
-| **Risco 3** — Falta de Controle Visual | Camera AI Module (YOLO v8) | Detecção automática de capacete, objetos suspeitos; bloqueio automático sem intervenção do operador | Evento VISUAL_CHECK_FAILED auditado + vídeo snippet |
-| **Risco 4** — Vulnerabilidade a Coação | Coercion Engine + Audio Module | Análise composta: palavras-chave + hesitação vocal + horário atípico + histórico de autorização | Alerta silencioso COERCION_RISK_DETECTED escalado para operador e SIEM |
-| **Restrição** — Sem atrito excessivo | Edge Orchestrator + Cache | Whitelist local, decisão em < 500ms, push notification com deep link 1-tap para morador | Métrica de tempo médio de autorização |
-| **Restrição** — Escalável sem contratar | Kubernetes (EKS) + Arquitetura de eventos | Auto-scaling por volume de eventos; operador supervisiona exceções, não executa | Relação operadores/condomínios pode crescer de 1:2,5 para 1:8+ |
+| **Risco 1** — Falta de Garantia de Processo | Decision Engine (Saga) | Dois branches obrigatórios: visitante existente (5 eventos) e visitante novo (6 eventos com `VISITOR_REGISTERED`). Nenhuma etapa pode ser pulada. | Cadeia de eventos com `VISITOR_REGISTERED` provando que o cadastro foi **criado** antes da autorização |
+| **Risco 2** — Ausência de Evidências Auditáveis | Audit Service (CQRS Write) + `VISITOR_REGISTERED` | Hash encadeado SHA-256; append-only; `VISITOR_REGISTERED` prova criação do cadastro; `AUTHORIZATION_GRANTED` prova autorização explícita com biometria | Cadeia inviolável cobrindo todos os itens do TC: criação, validação, autorização e liberação |
+| **Risco 3** — Falta de Controle Visual | Camera AI Module (YOLO v8) | Detecção automática de capacete e objetos suspeitos; bloqueio automático sem intervenção do operador | Evento `VISUAL_CHECK_FAILED` auditado + snippet de vídeo |
+| **Risco 4** — Vulnerabilidade a Coação | Coercion Engine (Vetor A) + Panic Code no App (Vetor B) | **Vetor A:** análise vocal no totem (palavras-chave + hesitação). **Vetor B:** panic code silencioso no app do morador (hold 3s ou PIN alternativo) + anomalia comportamental na autorização | `COERCION_RISK_DETECTED` (Vetor A) + `COERCION_SILENT_ALARM` (Vetor B) — acesso liberado para não escalar ameaça |
+| **Restrição** — Sem atrito excessivo | Edge Orchestrator + Cache | Whitelist local, decisão em < 500ms, push 1-tap para morador; visitante pré-cadastrado tem happy path mais rápido que o fluxo atual | Métrica de tempo médio de autorização |
+| **Restrição** — Escalável sem contratar | Kubernetes (EKS) + EDA | Auto-scaling por volume; operador supervisiona exceções, não executa o processo | Relação operadores/condomínios: de 1:2,5 para 1:8+ |
 
 ---
 

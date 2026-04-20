@@ -18,47 +18,51 @@ Em uma arquitetura **request-response tradicional**:
 ```
 POST /liberar-acesso → { ok: true }
 ```
-O que aconteceu entre a requisição e a resposta é **invisível**. Não há como provar que:
-- O cadastro foi consultado
-- O morador foi contactado
-- A autorização foi explicitamente concedida
-- Cada validação foi executada na ordem correta
+O que aconteceu entre a requisição e a resposta é **invisível**. Não há como provar que o cadastro foi criado, o morador contactado e a autorização explicitamente concedida.
 
 ---
 
 ## Decisão
 
-Adotamos **Event-Driven Architecture com padrão Saga Orquestrado** para o fluxo de acesso.
+Adotamos **Event-Driven Architecture com padrão Saga Orquestrado**.
 
-### Princípio
-Cada etapa do fluxo é uma **transição de estado explícita** que:
-1. Gera um evento imutável publicado no broker (AWS SQS)
-2. É persistida no Audit Service antes de avançar
-3. Só permite progresso quando o evento anterior for confirmado
-
-### Cadeia obrigatória de eventos
+### Cadeia de eventos — Branch A (visitante existente)
 ```
-VISITOR_PRESENTED
-    → VISUAL_CHECK_PASSED (ou VISUAL_CHECK_FAILED → encerra)
-        → VISITOR_LOOKUP_COMPLETED
-            → AUTHORIZATION_REQUESTED
-                → AUTHORIZATION_GRANTED (ou AUTHORIZATION_DENIED → encerra)
-                    → ACCESS_GRANTED
+VISITOR_PRESENTED → VISUAL_CHECK_PASSED → VISITOR_LOOKUP_COMPLETED →
+AUTHORIZATION_REQUESTED → AUTHORIZATION_GRANTED → ACCESS_GRANTED
 ```
 
-**Nenhuma etapa pode ser pulada.** O Decision Engine (Saga Orchestrator) valida a sequência antes de emitir o próximo comando. Se um evento não for confirmado dentro do timeout definido, o Saga emite `ACCESS_TIMEOUT` e encerra o fluxo.
+### Cadeia de eventos — Branch B (visitante novo)
+```
+VISITOR_PRESENTED → VISUAL_CHECK_PASSED → VISITOR_LOOKUP_COMPLETED →
+VISITOR_REGISTERED → AUTHORIZATION_REQUESTED → AUTHORIZATION_GRANTED → ACCESS_GRANTED
+```
 
-### Estrutura de cada evento
+O evento `VISITOR_REGISTERED` foi adicionado para fechar o Gap crítico do Risco 1 e Risco 2:
+o TC exige prova de que o cadastro foi **criado**, não apenas consultado.
+
+### Detecção de Coação — Dois Vetores
+
+O TC descreve dois cenários distintos que exigem mecanismos diferentes:
+
+**Vetor A — Pressão no Totem (lado do visitante):**
+Coercion Engine no Edge analisa o áudio: palavras-chave, hesitação vocal, score composto.
+Emite `COERCION_RISK_DETECTED` silenciosamente.
+
+**Vetor B — Coação do Morador internamente (lado do app):**
+O TC diz: *"morador legítimo possa estar sob ameaça — a simples confirmação de identidade deixa de ser indicador confiável."* Para este cenário:
+
+- **Panic Code Silencioso:** segurar o botão de autorização por 3s ou usar PIN alternativo gera `COERCION_SILENT_ALARM` sem bloquear o acesso — para não escalar a ameaça.
+- **Anomalia Comportamental:** velocidade de resposta atípica, geolocalização incomum, padrão de toque diferente do baseline histórico.
+
 ```json
 {
-  "event_id": "uuid-v4",
-  "event_type": "AUTHORIZATION_GRANTED",
-  "aggregate_id": "access-request-uuid",
-  "timestamp": "2026-03-15T08:32:41.123Z",
-  "payload": { "morador_id": "...", "biometric_hash": "..." },
-  "previous_event_id": "uuid-do-evento-anterior",
-  "previous_hash": "sha256(evento_anterior)",
-  "current_hash": "sha256(event_id + timestamp + payload + previous_hash)"
+  "event_type": "COERCION_SILENT_ALARM",
+  "trigger": "panic_hold | panic_pin | behavioral_anomaly",
+  "access_request_id": "uuid",
+  "morador_id": "uuid",
+  "response_time_ms": 450,
+  "dispatched_to": ["operator", "siem"]
 }
 ```
 
@@ -68,33 +72,29 @@ VISITOR_PRESENTED
 
 | Alternativa | Motivo de Rejeição |
 |-------------|-------------------|
-| **REST síncrono** | Não garante rastro de etapas intermediárias — resolve só o evento final |
-| **Banco compartilhado** entre serviços | Acoplamento forte; dificulta escala e manutenção independente |
-| **Saga coreografada** (sem orquestrador) | Difícil garantir sequência obrigatória e detectar etapas puladas |
-| **Workflow engine** (Temporal, Conductor) | Overhead excessivo para o escopo atual; pode ser adotado em escala futura |
+| **REST síncrono** | Não garante rastro de etapas intermediárias |
+| **Banco compartilhado** | Acoplamento forte; dificulta escala independente |
+| **Saga coreografada** | Difícil garantir sequência obrigatória de etapas |
 
 ---
 
 ## Consequências
 
 ### Positivas ✅
-- Rastro completo e imutável de cada etapa (elimina Risco 1 e Risco 2)
-- Desacoplamento: Audit Service processa independentemente sem afetar o fluxo
-- Extensível: novos consumidores (Anomaly Detector, SIEM) adicionados sem alterar o fluxo principal
-- Retry automático via Dead Letter Queue (DLQ) para eventos não processados
-- Replay de eventos para investigação de incidentes
+- Rastro completo de cada etapa — Risco 1 e Risco 2 fechados
+- `VISITOR_REGISTERED` comprova criação de cadastro (gap original corrigido)
+- Dois vetores de coação cobertos — Risco 4 fechado
+- Extensível: novos consumidores adicionados sem alterar o fluxo principal
+- Retry automático via Dead Letter Queue
 
 ### Negativas / Trade-offs ⚠️
-- Consistência **eventual** (não imediata) — aceitável para auditoria, não para decisão de acesso
+- Consistência eventual (não imediata)
 - Complexidade operacional maior que REST simples
-- Monitoramento de consumer lag na fila é obrigatório (alerta se lag > threshold)
+- Monitoramento de consumer lag obrigatório
 - Idempotência obrigatória em todos os consumidores
 
 ---
 
 ## Critério de Revisão
 
-Reavaliar para **Apache Kafka** se:
-- Volume superar 10.000 eventos/hora por condomínio
-- Necessidade de replay histórico de longo prazo (event sourcing completo)
-- Múltiplos sistemas externos precisarem consumir os mesmos eventos
+Reavaliar para **Apache Kafka** se volume superar 10.000 eventos/hora por condomínio.
